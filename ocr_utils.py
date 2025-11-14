@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-ocr_utils.py - Improved OCR + faint-text detection + inpainting blending for DICOM de-id.
+ocr_utils.py
 
-Features
-- Tesseract OCR token detection (with confidence handling)
-- Keyword and metadata-driven matches (explicit matching against metadata PHI)
-- Faint / washed-out text detector using top-hat + adaptive threshold
-- Merge OCR and faint-text masks, morphological smoothing
-- Inpaint using OpenCV (TELEA) and soft-edge blending to avoid sharp seams
-- Safe PixelData writeback preserving PhotometricInterpretation, SamplesPerPixel,
-  BitsAllocated/BitsStored/HighBit where possible
+Precise OCR-driven PHI masking for DICOM burned-in text.
+
+Flow:
+1. Extract original pixel array and an 8-bit preview image.
+2. Run Tesseract word-level OCR (boxes + confidence).
+3. For each OCR word box:
+   a. crop the *preview* region (same coords as original preview)
+   b. build a tight per-pixel text mask using local adaptive threshold + morphology
+   c. extract the word string, normalize, compare to metadata PHI and keywords
+   d. if matched -> mark those exact stroke pixels (with a tiny padding) for redaction
+4. Inpaint+soft-blend only on the union of those precise pixel regions.
+5. Write PixelData back, preserve PhotometricInterpretation, BitsAllocated/Stored, SamplesPerPixel where feasible.
 """
 
 import re
@@ -22,9 +26,15 @@ import cv2
 import pydicom
 
 
-# -----------------------
-# Utility / normalization
-# -----------------------
+# ---------- small tunables ----------
+OCR_CONF_THRESHOLD = 40       # keep words with conf >= this (tune per your OCR)
+LOCAL_PADDING_PIXELS = 3      # tiny padding around detected text strokes (not box)
+MIN_COMPONENT_AREA = 8        # minimum connected component area (pixels) to keep in local mask
+KEYWORDS = ['ID', 'NAME', 'DOB', 'DATE', 'TIME', 'ACCESSION', 'AGE', 'HOSPITAL',
+            'PATIENT', 'PHYSICIAN', 'INSTITUTION', 'PORTABLE', 'MRN']
+
+
+# ---------- utilities ----------
 def normalize_text(text: str) -> str:
     if not text:
         return ''
@@ -35,62 +45,26 @@ def normalize_text(text: str) -> str:
     return s.upper().strip()
 
 
-# -----------------------
-# Preprocessing for OCR
-# -----------------------
-def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
-    """
-    Convert PIL image to an 8-bit image tuned for Tesseract:
-    - Grayscale, percentile contrast stretch
-    - Conditional inversion (if background dark)
-    - Otsu threshold fallback to adaptive threshold
-    """
-    gray = pil_img.convert('L')
-    arr = np.array(gray).astype(np.uint8)
-
-    # Contrast stretch 2nd-98th percentile
-    p2, p98 = np.percentile(arr, (2, 98))
-    if p98 > p2:
-        arr = np.clip((arr - p2) * 255.0 / (p98 - p2), 0, 255).astype(np.uint8)
-
-    # If overall background is dark, invert so text becomes dark on light
-    if arr.mean() < 127:
-        arr = 255 - arr
-
-    # Try Otsu; fallback to adaptive
-    try:
-        _, th = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        arr = th
-    except Exception:
-        arr = cv2.adaptiveThreshold(arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 11, 2)
-
-    return Image.fromarray(arr)
-
-
-# -----------------------
-# DICOM -> preview helper
-# -----------------------
+# ---------- preview & conversion ----------
 def get_image_from_dicom(ds: pydicom.dataset.Dataset) -> Tuple[np.ndarray, Image.Image]:
     """
-    Return (original_array, ocr_preview_pil_image)
-    - original_array is the raw numpy array from ds.pixel_array (unchanged)
-    - ocr_preview is an 8-bit PIL image used for OCR and faint-text detection
+    Return (original_array, ocr_preview_pil_image).
+    Original array is the raw ds.pixel_array.
+    ocr_preview is an 8-bit PIL image used for OCR and local mask extraction.
     """
     try:
-        orig = ds.pixel_array  # may raise
+        orig = ds.pixel_array
     except Exception as e:
-        raise RuntimeError(f"Could not read pixel array: {e}")
+        raise RuntimeError(f"Could not get pixel_array: {e}")
 
-    # Build an 8-bit preview image for OCR (keep aspect & approximate contrast)
+    # build 8-bit preview image preserving contrast approx.
     if orig.ndim == 3:
-        # If channel-last RGB/RGBA, convert to RGB PIL
+        # channel-last: RGB or RGBA or other
         if orig.shape[2] == 4:
             vis = cv2.cvtColor(orig, cv2.COLOR_RGBA2RGB)
         elif orig.shape[2] == 3:
             vis = orig
         else:
-            # unexpected channels, take first channel
             vis = orig[..., 0]
         if vis.dtype != np.uint8:
             vis8 = ((vis.astype(np.float32) - float(vis.min())) / max(1.0, float(vis.max() - vis.min())) * 255.0).astype(np.uint8)
@@ -98,133 +72,70 @@ def get_image_from_dicom(ds: pydicom.dataset.Dataset) -> Tuple[np.ndarray, Image
             vis8 = vis.copy()
         pil = Image.fromarray(vis8)
     else:
-        # grayscale/single-channel: scale to 8-bit for preview
         if orig.dtype != np.uint8:
             vis8 = ((orig.astype(np.float32) - float(orig.min())) / max(1.0, float(orig.max() - orig.min())) * 255.0).astype(np.uint8)
         else:
             vis8 = orig.copy()
         pil = Image.fromarray(vis8)
 
-    ocr_img = preprocess_image_for_ocr(pil)
-    return orig, ocr_img
+    return orig, pil
 
 
-# -----------------------
-# Faint-text detector
-# -----------------------
-def detect_faint_text(preview_img: Image.Image) -> np.ndarray:
+# ---------- local text stroke mask (very tight) ----------
+def build_precise_text_mask(crop_gray: np.ndarray) -> np.ndarray:
     """
-    Detect faint/washed-out bright text using morphological top-hat and adaptive thresholding.
-    Returns a single-channel uint8 mask (255 where text likely is).
+    Given a grayscale crop (uint8) containing one word (or small phrase),
+    return a mask (same shape) where strokes are marked 255 and background 0.
+
+    Steps:
+    - small blur to remove noise
+    - adaptive threshold (local) to separate strokes
+    - morphological open to remove specks
+    - keep components with area >= MIN_COMPONENT_AREA
+    - return mask
     """
-    gray = np.array(preview_img.convert('L')).astype(np.uint8)
+    if crop_gray.dtype != np.uint8:
+        crop = ((crop_gray.astype(np.float32) - float(crop_gray.min())) / max(1.0, float(crop_gray.max() - crop_gray.min())) * 255.0).astype(np.uint8)
+    else:
+        crop = crop_gray.copy()
 
-    # Small Gaussian to reduce noise
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Slight blur
+    b = cv2.GaussianBlur(crop, (3, 3), 0)
 
-    # Use a relatively large structuring element for top-hat to reveal bright strokes on uneven background
-    h = max(9, int(max(3, min(gray.shape) * 0.02)))  # adaptive kernel size
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (h, h))
-    tophat = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, k)
-
-    # Adaptive threshold on top-hat image; invert so bright strokes become white
+    # Adaptive threshold - use mean C with a small negative constant to favor faint strokes
     try:
-        th = cv2.adaptiveThreshold(tophat, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                   cv2.THRESH_BINARY, 31, -8)
+        th = cv2.adaptiveThreshold(b, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 6)
     except Exception:
-        _, th = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, th = cv2.threshold(b, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Clean with morphological close to fill letters
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # Morphological open to remove tiny noise, keep letters
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    opened = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    # Remove very small noise
-    nb_components, labels, stats, _ = cv2.connectedComponentsWithStats(th, connectivity=8)
-    mask = np.zeros_like(th)
-    for i in range(1, nb_components):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area >= 30:  # small area filter (tunable)
+    # Keep only reasonably sized connected components (to avoid speckle)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+    mask = np.zeros_like(opened)
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area >= MIN_COMPONENT_AREA:
             mask[labels == i] = 255
 
+    # final small dilate to recover thin strokes that may have been broken
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)), iterations=1)
     return mask
 
 
-# -----------------------
-# OCR mask builder
-# -----------------------
-def _build_mask_from_ocr(ocr_data: dict, image_shape: Tuple[int, int], conf_threshold: int = 30) -> np.ndarray:
+# ---------- inpaint + soft blend (applies only inside mask) ----------
+def inpaint_and_blend_region(orig_arr: np.ndarray, pixel_mask: np.ndarray) -> np.ndarray:
     """
-    Build a mask from OCR tokens. image_shape is (h, w) of the OCR preview image.
+    Inpaint only the pixels where pixel_mask == 255.
+    pixel_mask is 2D, same size as orig_arr's image plane.
+    Returns array with same dtype/shape as orig_arr.
     """
-    mask = np.zeros(image_shape, dtype=np.uint8)
-    heights = [int(h) for h in ocr_data.get('height', []) if h and int(h) > 0]
-    median_h = int(np.median(heights)) if heights else 10
+    if pixel_mask.dtype != np.uint8:
+        pixel_mask = pixel_mask.astype(np.uint8)
 
-    n = len(ocr_data.get('text', []))
-    for i in range(n):
-        text = ocr_data['text'][i]
-        conf_str = ocr_data['conf'][i]
-        try:
-            conf = float(conf_str) if conf_str not in (None, '') else -1.0
-        except Exception:
-            conf = -1.0
-        if not text.strip() or conf < conf_threshold:
-            continue
-
-        x = int(ocr_data['left'][i])
-        y = int(ocr_data['top'][i])
-        w = int(ocr_data['width'][i])
-        h = int(ocr_data['height'][i])
-        buf = max(3, int(h * 0.4))
-        x0 = max(0, x - buf)
-        y0 = max(0, y - buf)
-        x1 = min(image_shape[1], x + w + buf)
-        y1 = min(image_shape[0], y + h + buf)
-        cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
-
-    # Connect nearby boxes
-    ksize = max(3, (median_h // 2) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    mask = cv2.dilate(mask, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return mask
-
-
-# -----------------------
-# PHI matching heuristic
-# -----------------------
-def _matches_phi(text: str, metadata_values: List[str], keywords: List[str]) -> bool:
-    nt = normalize_text(text)
-    if not nt:
-        return False
-    # metadata exact / substring match
-    for m in metadata_values:
-        if not m:
-            continue
-        if m in nt or nt in m:
-            return True
-    # keyword
-    for k in keywords:
-        if k in nt:
-            return True
-    # date or long numeric
-    if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text) or re.search(r'\d{6,}', text):
-        return True
-    return False
-
-
-# -----------------------
-# Inpaint + soft blend
-# -----------------------
-def _inpaint_and_blend(orig_arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    Inpaint orig_arr on mask (mask: 0/255, same HxW).
-    Returns array with same dtype/shape where possible.
-    """
-    if mask.dtype != np.uint8:
-        mask = mask.astype(np.uint8)
-
-    # Create 3-channel uint8 image for inpainting
+    # Convert original to 3-channel uint8 for inpainting (so color/grayscale handled uniformly)
     if orig_arr.ndim == 2:
         vis8 = ((orig_arr.astype(np.float32) - float(orig_arr.min())) / max(1.0, float(orig_arr.max() - orig_arr.min())) * 255.0).astype(np.uint8)
         vis_bgr = cv2.cvtColor(vis8, cv2.COLOR_GRAY2BGR)
@@ -234,7 +145,7 @@ def _inpaint_and_blend(orig_arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         if vis.dtype != np.uint8:
             vis8 = ((vis.astype(np.float32) - float(vis.min())) / max(1.0, float(vis.max() - vis.min())) * 255.0).astype(np.uint8)
         else:
-            vis8 = vis.copy()
+            vis8 = vis
         if vis8.shape[2] == 4:
             vis_bgr = cv2.cvtColor(vis8, cv2.COLOR_RGBA2BGR)
         elif vis8.shape[2] == 3:
@@ -243,25 +154,29 @@ def _inpaint_and_blend(orig_arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
             vis_bgr = cv2.cvtColor(vis8[..., 0], cv2.COLOR_GRAY2BGR)
         is_gray = False
 
-    # Resize mask to match vis_bgr in case shapes differ
-    if mask.shape != vis_bgr.shape[:2]:
-        mask_resized = cv2.resize(mask, (vis_bgr.shape[1], vis_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
-    else:
-        mask_resized = mask
+    # If mask size differs, resize mask nearest
+    if pixel_mask.shape != vis_bgr.shape[:2]:
+        pixel_mask = cv2.resize(pixel_mask, (vis_bgr.shape[1], vis_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    # Prepare inpaint mask: must be 8-bit single channel
+    inpaint_mask = (pixel_mask > 0).astype(np.uint8) * 255
+
+    # If mask is empty, return original
+    if inpaint_mask.sum() == 0:
+        return orig_arr
 
     # Inpaint
-    inpaint_radius = 3
     try:
-        inpainted = cv2.inpaint(vis_bgr, mask_resized, inpaint_radius, cv2.INPAINT_TELEA)
+        inpainted = cv2.inpaint(vis_bgr, inpaint_mask, 3, cv2.INPAINT_TELEA)
     except Exception as e:
-        raise RuntimeError(f"inpaint failed: {e}")
+        raise RuntimeError(f"Inpainting failed: {e}")
 
-    # Soft-edge blend: Gaussian blur mask and linear alpha
-    blurred = cv2.GaussianBlur(mask_resized, (9, 9), 0)
+    # Soft blend on mask boundary: blur mask and alpha-blend
+    blurred = cv2.GaussianBlur(inpaint_mask, (9, 9), 0)
     alpha = (blurred.astype(np.float32) / 255.0)[:, :, None]
     blended = (alpha * inpainted.astype(np.float32) + (1.0 - alpha) * vis_bgr.astype(np.float32)).astype(np.uint8)
 
-    # Convert back to original dtype/range
+    # Convert back to original dtype & channels
     if is_gray:
         blended_gray = cv2.cvtColor(blended, cv2.COLOR_BGR2GRAY)
         if orig_arr.dtype == np.uint8:
@@ -275,20 +190,17 @@ def _inpaint_and_blend(orig_arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         else:
             out = (blended.astype(np.float32) / 255.0 * (orig_arr.max() - orig_arr.min()) + orig_arr.min())
             out_arr = out.astype(orig_arr.dtype)
-            # If original had 4 channels, attempt to re-attach an alpha channel (zeros)
             if orig_arr.ndim == 3 and orig_arr.shape[2] == 4:
                 alpha_chan = np.zeros((out_arr.shape[0], out_arr.shape[1], 1), dtype=out_arr.dtype)
                 out_arr = np.concatenate([out_arr, alpha_chan], axis=2)
             return out_arr
 
 
-# -----------------------
-# PixelData writeback
-# -----------------------
+# ---------- writeback ----------
 def _write_back_pixeldata(ds: pydicom.dataset.Dataset, arr: np.ndarray):
     """
-    Update ds.PixelData and related metadata fields to reflect arr.
-    Handles 2D grayscale and 3-channel RGB arrays.
+    Safely write arr back into ds.PixelData and adjust basic attributes.
+    Only supports 2D grayscale and 3-channel RGB arrays.
     """
     if np.issubdtype(arr.dtype, np.floating):
         arr = np.clip(arr, arr.min(), arr.max())
@@ -329,7 +241,6 @@ def _write_back_pixeldata(ds: pydicom.dataset.Dataset, arr: np.ndarray):
             ds.PixelData = arr.tobytes()
             return
         elif ch == 4:
-            # drop alpha, store as RGB
             rgb = arr[..., :3]
             ds.SamplesPerPixel = 3
             ds.PhotometricInterpretation = getattr(ds, 'PhotometricInterpretation', 'RGB')
@@ -337,7 +248,6 @@ def _write_back_pixeldata(ds: pydicom.dataset.Dataset, arr: np.ndarray):
             ds.PixelData = rgb.tobytes()
             return
         else:
-            # unexpected channel count: reduce to first channel
             gray = arr[..., 0]
             _write_back_pixeldata(ds, gray)
             return
@@ -345,143 +255,183 @@ def _write_back_pixeldata(ds: pydicom.dataset.Dataset, arr: np.ndarray):
     raise ValueError("Unsupported array shape for PixelData writeback.")
 
 
-# -----------------------
-# Main entry
-# -----------------------
+# ---------- main entry ----------
 def run_ocr_and_mask(ds: pydicom.dataset.Dataset, phis_to_mask: Dict[str, str], output_path: str):
     """
-    Extracts pixel array and OCR preview, detects PHI regions using:
-      - direct OCR token matches against metadata and keywords
-      - geometry-based OCR mask fallback
-      - faint-text detector (top-hat)
-      - keyword-driven global expansion
-    Then inpaints + blends and writes PixelData back safely.
+    Core function called from deidentify_runner.
+    Matches OCR against phis_to_mask (dict of metadata PHI) and keywords.
+    Redacts only the precise stroke pixels for matched words.
     """
     try:
-        original_arr, ocr_preview = get_image_from_dicom(ds)
+        original_arr, preview_pil = get_image_from_dicom(ds)
     except Exception as e:
-        print(f"  Could not prepare preview image: {e}")
+        print(f"  Could not extract image: {e}")
         try:
             ds.save_as(output_path)
-        except Exception as ee:
-            print(f"  Failed saving original: {ee}")
+        except Exception:
+            pass
         return
 
-    # Run OCR
-    tconf = '--oem 1 --psm 6'
+    # Run Tesseract word-level detection
+    tconf = '--oem 1 --psm 6'  # word/line layout
     try:
-        ocr_data = pytesseract.image_to_data(ocr_preview, config=tconf, output_type=pytesseract.Output.DICT)
+        ocr = pytesseract.image_to_data(preview_pil, config=tconf, output_type=pytesseract.Output.DICT)
     except Exception as e:
-        print(f"  Tesseract failed: {e}. Saving cleaned metadata DICOM.")
+        print(f"  Tesseract failed: {e}")
         try:
             ds.save_as(output_path)
-        except Exception as ee:
-            print(f"  Failed to save DICOM: {ee}")
+        except Exception:
+            pass
         return
 
-    # Prepare metadata and keyword lists
+    # Prepare PHI list and keywords
     metadata_values = [normalize_text(v) for v in phis_to_mask.values() if v and len(str(v)) > 2]
-    keywords = ['ID', 'NAME', 'DOB', 'DATE', 'TIME', 'ACCESSION', 'AGE',
-                'HOSPITAL', 'PATIENT', 'PHYSICIAN', 'INSTITUTION', 'PORTABLE', 'MRN']
+    keywords = KEYWORDS
 
-    # Build OCR mask from tokens that match PHI heuristics
-    preview_gray = np.array(ocr_preview.convert('L'))
-    image_shape = preview_gray.shape  # (h, w)
-    used_mask = np.zeros(image_shape, dtype=np.uint8)
+    # Prepare an empty per-pixel mask on the preview resolution
+    preview_gray = np.array(preview_pil.convert('L'))
+    h, w = preview_gray.shape
+    final_pixel_mask = np.zeros((h, w), dtype=np.uint8)
 
-    n = len(ocr_data.get('text', []))
-    for i in range(n):
-        text = ocr_data['text'][i]
-        conf_str = ocr_data['conf'][i]
+    n_words = len(ocr.get('text', []))
+    for i in range(n_words):
+        text = ocr['text'][i].strip()
+        if not text:
+            continue
+        conf_str = ocr['conf'][i]
         try:
             conf = float(conf_str) if conf_str not in (None, '') else -1.0
         except Exception:
             conf = -1.0
-        if not text.strip() or conf < 30:
+        # Skip very low confidence words
+        if conf < OCR_CONF_THRESHOLD:
             continue
-        if _matches_phi(text, metadata_values, keywords):
-            x = int(ocr_data['left'][i])
-            y = int(ocr_data['top'][i])
-            w = int(ocr_data['width'][i])
-            h = int(ocr_data['height'][i])
-            buf = max(3, int(h * 0.45))
-            x0 = max(0, x - buf)
-            y0 = max(0, y - buf)
-            x1 = min(image_shape[1], x + w + buf)
-            y1 = min(image_shape[0], y + h + buf)
-            cv2.rectangle(used_mask, (x0, y0), (x1, y1), 255, -1)
 
-    # If no direct matches found, fall back to OCR geometry mask (wider)
-    if used_mask.sum() == 0:
-        used_mask = _build_mask_from_ocr(ocr_data, image_shape, conf_threshold=30)
-
-    # Faint-text mask (detect very light text that OCR may miss)
-    faint_mask = detect_faint_text(ocr_preview)
-
-    # Merge masks
-    merged = cv2.bitwise_or(used_mask, faint_mask)
-
-    # Keyword-driven expansion:
-    # if any OCR token contains partial keyword (like HOSP or HOSPT), expand mask along same horizontal band
-    for i in range(n):
-        txt = ocr_data['text'][i]
-        if not txt.strip():
+        # Read box
+        x = int(ocr['left'][i])
+        y = int(ocr['top'][i])
+        ww = int(ocr['width'][i])
+        hh = int(ocr['height'][i])
+        if ww <= 0 or hh <= 0:
             continue
-        nt = normalize_text(txt)
-        for kw in keywords:
-            if kw in nt or (len(kw) > 4 and kw[:4] in nt) or (len(nt) >= 4 and nt in kw):
-                # expand along line
-                y = int(ocr_data['top'][i])
-                h = int(ocr_data['height'][i]) if ocr_data['height'][i] else 12
-                band = max(12, int(h * 3))
-                y0 = max(0, y - band)
-                y1 = min(image_shape[0], y + band)
-                # fill across entire width to catch broken fragments (but keep morphological ops to avoid huge masks)
-                merged[y0:y1, :] = cv2.bitwise_or(merged[y0:y1, :], 255)
 
-    # Morphological smoothing
-    heights = [int(h) for h in ocr_data.get('height', []) if h and int(h) > 0]
-    median_h = int(np.median(heights)) if heights else 10
-    ksize = max(3, (median_h // 2) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    merged = cv2.dilate(merged, kernel, iterations=1)
-    merged = cv2.medianBlur(merged, 5)
+        # Crop corresponding area from preview_gray
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(w, x + ww)
+        y1 = min(h, y + hh)
+        crop = preview_gray[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
 
-    # If still empty, nothing to inpaint
-    if merged.sum() == 0:
-        print("  No likely PHI regions found (including faint text). Saving metadata-cleaned DICOM unchanged.")
+        # Build precise stroke mask for this crop
+        local_mask = build_precise_text_mask(crop)
+
+        # If nothing detected inside box (OCR saw it but our stroke mask didn't), try a tiny loosened threshold:
+        if local_mask.sum() == 0:
+            # gentle fallback: small threshold to pick thin strokes
+            try:
+                _, th2 = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                th2 = cv2.morphologyEx(th2, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)), iterations=1)
+                # keep only components big enough
+                nl, labs, stats, _ = cv2.connectedComponentsWithStats(th2, connectivity=8)
+                mask2 = np.zeros_like(th2)
+                for j in range(1, nl):
+                    if int(stats[j, cv2.CC_STAT_AREA]) >= max(2, MIN_COMPONENT_AREA // 2):
+                        mask2[labs == j] = 255
+                local_mask = mask2
+            except Exception:
+                pass
+
+        # Normalize OCR text and check match against metadata and keywords
+        nt = normalize_text(text)
+        matched = False
+        # exact / substring match against metadata values
+        for mv in metadata_values:
+            if not mv:
+                continue
+            if mv in nt or nt in mv:
+                matched = True
+                break
+        # keyword match
+        if not matched:
+            for kw in keywords:
+                if kw in nt:
+                    matched = True
+                    break
+        # date or long numeric heuristics
+        if not matched:
+            if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text) or re.search(r'\d{6,}', text):
+                matched = True
+
+        # If matched, copy local_mask into final_pixel_mask (with tiny padding)
+        if matched and local_mask.sum() > 0:
+            # pad local stroke mask by LOCAL_PADDING_PIXELS inside the crop coords
+            pad = LOCAL_PADDING_PIXELS
+            # dilate mask within crop to get small padding
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1))
+            padded_local = cv2.dilate(local_mask, k, iterations=1)
+
+            # place into final mask at correct coordinates
+            final_pixel_mask[y0:y1, x0:x1] = cv2.bitwise_or(final_pixel_mask[y0:y1, x0:x1], padded_local)
+
+        # If matched but local mask empty (rare), fall back to a minimal rectangular mask of box with tiny pad
+        elif matched and local_mask.sum() == 0:
+            pad = max(1, min(LOCAL_PADDING_PIXELS, hh // 6))
+            rx0 = max(0, x0 - pad)
+            ry0 = max(0, y0 - pad)
+            rx1 = min(w, x1 + pad)
+            ry1 = min(h, y1 + pad)
+            final_pixel_mask[ry0:ry1, rx0:rx1] = 255
+
+    # If final_pixel_mask is empty -> nothing matched; save unchanged
+    if final_pixel_mask.sum() == 0:
+        print("  No matched PHI words found (precise). Saving metadata-cleaned DICOM unchanged.")
         try:
             ds.save_as(output_path)
         except Exception as e:
             print(f"  Failed to save DICOM: {e}")
         return
 
-    # Inpaint and blend back into original array
+    # At this stage, final_pixel_mask marks the exact strokes to redact on the preview resolution.
+    # We need to map this to the original pixel-array coordinates. The preview was created by scaling 16-bit/float -> 8-bit
+    # but kept same spatial resolution, so coordinates are consistent with original ds.pixel_array shape if same HxW.
+    # If original array has different size, we must scale mask accordingly.
+
+    orig = original_arr
+    # Determine mapping: preview shape vs orig shape
+    if orig.ndim == 3:
+        orig_h, orig_w = orig.shape[0], orig.shape[1]
+    else:
+        orig_h, orig_w = orig.shape[0], orig.shape[1]
+
+    mask_to_write = final_pixel_mask
+    if mask_to_write.shape != (orig_h, orig_w):
+        # resize mask to original resolution nearest
+        mask_to_write = cv2.resize(mask_to_write, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+
+    # Inpaint and blend only on mask_to_write (precise pixels)
     try:
-        inpainted = _inpaint_and_blend(original_arr, merged)
+        out_arr = inpaint_and_blend_region(orig, mask_to_write)
     except Exception as e:
-        print(f"  Inpainting failed: {e}. Falling back to opaque rectangles.")
-        # Fallback: apply opaque zero rectangles on original array for safety
-        fallback = original_arr.copy()
-        ys, xs = np.where(merged > 0)
-        if ys.size:
-            y0, y1 = ys.min(), ys.max()
-            x0, x1 = xs.min(), xs.max()
-            if fallback.ndim == 2:
-                fallback[y0:y1 + 1, x0:x1 + 1] = 0
-            else:
-                fallback[y0:y1 + 1, x0:x1 + 1, :] = 0
+        print(f"  Inpaint failed: {e}. Applying conservative opaque fallback.")
+        # fallback: cover the exact mask pixels with black
+        fallback = orig.copy()
+        if fallback.ndim == 2:
+            fallback[mask_to_write > 0] = 0
+        else:
+            fallback[mask_to_write > 0, :] = 0
         try:
             _write_back_pixeldata(ds, fallback)
             ds.save_as(output_path)
             print(f"  Saved fallback masked file to {output_path}")
         except Exception as ee:
-            print(f"  Failed saving fallback: {ee}")
+            print(f"  Failed to save fallback: {ee}")
         return
 
-    # Write back and save final DICOM
+    # Write final image back to DICOM
     try:
-        _write_back_pixeldata(ds, inpainted)
+        _write_back_pixeldata(ds, out_arr)
         ds.save_as(output_path)
         print(f"  Saved de-identified file to {output_path}")
     except Exception as e:
