@@ -1,31 +1,59 @@
 import pydicom
+import pydicom.uid
 import os
-import shutil
 from ocr_utils import run_ocr_and_mask
-
-# # --- Configuration ---
-# INPUT_DIR = './input_dcm'
-# OUTPUT_DIR = './output_dcm'
 
 # --- Configuration ---
 # Use r-strings for Windows paths to handle backslashes correctly
 INPUT_DIR = r"D:\0000 study spacd\06.1 SEM8\00 internship\01 go zeal\02 projects\02 dicom-deid-project\input_dcm"
 OUTPUT_DIR = r"D:\0000 study spacd\06.1 SEM8\00 internship\01 go zeal\02 projects\02 dicom-deid-project\output_dcm"
 
-# HIPAA Safe Harbor Identifiers List (for metadata removal)
+# DICOM Tags from your COMPLETE list, labeled for clarity (Hexadecimal Tag, Keyword)
 PHI_TAGS = [
+    # Patient Identifying Information
     (0x0010, 0x0010), # PatientName
     (0x0010, 0x0020), # PatientID
     (0x0010, 0x0030), # PatientBirthDate
     (0x0010, 0x0032), # PatientBirthTime
-    (0x0010, 0x0040), # PatientSex (Often retained for research, but removing per your list)
-    # ... Add all other tags from your list (e.g., InstitutionName, StudyDate, etc.)
-    # We will use a smaller, illustrative list here for brevity:
+    (0x0010, 0x0040), # PatientSex
+    (0x0010, 0x1010), # PatientAge
+    (0x0010, 0x1000), # OtherPatientIDs
+    (0x0010, 0x1001), # OtherPatientNames
+    (0x0010, 0x1040), # PatientAddress
+    (0x0010, 0x2150), # PatientTelephoneNumbers
+    
+    # Institution and Location Information
+    (0x0008, 0x0080), # InstitutionName
+    (0x0008, 0x0081), # InstitutionAddress
+    (0x0008, 0x1040), # InstitutionalDepartmentName
+    (0x0008, 0x1010), # StationName
+    
+    # Physician and Operator Names
+    (0x0008, 0x0090), # ReferringPhysicianName
+    (0x0008, 0x0094), # ReferringPhysicianTelephoneNumbers
+    (0x0008, 0x0096), # RequestingPhysician
+    (0x0008, 0x9000), # PhysiciansOfRecord
+    (0x0008, 0x1050), # PerformingPhysicianName
+    (0x0008, 0x1084), # NameOfPhysiciansReadingStudy
+    (0x0008, 0x1070), # OperatorsName
+    (0x0040, 0x0006), # ScheduledPerformingPhysicianName
+    (0x0040, 0xA075), # VerifyingObserverName
+    (0x0040, 0xA078), # VerifyingObserverIdentificationCodeSequence
+    
+    # Dates, Times, and Study Identifiers
     (0x0008, 0x0020), # StudyDate
     (0x0008, 0x0030), # StudyTime
     (0x0008, 0x0050), # AccessionNumber
-    (0x0008, 0x0080), # InstitutionName
-    # ... many more ...
+    (0x0020, 0x0010), # StudyID
+    (0x0020, 0x0011), # SeriesNumber
+    
+    # Device Identifiers
+    (0x0018, 0x1000), # DeviceSerialNumber
+    (0x0018, 0x1002), # DeviceSeriesNumber
+    
+    # Unique Identifiers (UIDs - MUST be replaced, not deleted)
+    (0x0020, 0x000D), # StudyInstanceUID
+    (0x0020, 0x000E)  # SeriesInstanceUID
 ]
 
 # DICOM SOP Class UID for Secondary Capture (High-risk images)
@@ -39,49 +67,56 @@ def remove_metadata_phi(ds: pydicom.Dataset) -> dict:
     
     for tag in PHI_TAGS:
         if tag in ds:
-            # Store the original value for OCR comparison later
+            # Get the tag keyword and value before modification
             tag_name = ds[tag].keyword
             original_phis[tag_name] = str(ds[tag].value) 
             
-            # Remove the tag or replace with a blank string
-            if tag_name.endswith('UID') or tag_name.endswith('Number'):
-                 # Remap UIDs/Numbers (simple unique hash or deletion is common)
+            # Rule: Replace UIDs/Numbers/IDs with new unique values or '0'
+            if 'UID' in tag_name:
+                 ds[tag].value = pydicom.uid.generate_uid()
+            elif 'Number' in tag_name or 'ID' in tag_name:
                  ds[tag].value = '0' # Placeholder value
+            # Rule: Delete other PHI tags (Names, Dates, Addresses, etc.)
             else:
-                 # Delete the tag entirely
                  del ds[tag]
                  
-    # Critical step: Re-UID the study/series/instance to ensure uniqueness
-    pydicom.uid.generate_uid() # Initialize UID generator if needed
-    ds.StudyInstanceUID = pydicom.uid.generate_uid()
-    ds.SeriesInstanceUID = pydicom.uid.generate_uid()
-    
+    # Final safety check: ensure critical UIDs are new
+    if 'StudyInstanceUID' in ds:
+        ds.StudyInstanceUID = pydicom.uid.generate_uid()
+    if 'SeriesInstanceUID' in ds:
+        ds.SeriesInstanceUID = pydicom.uid.generate_uid()
+        
     return original_phis
 
 def should_run_ocr(ds: pydicom.Dataset) -> bool:
-    """Implements the targeted filtering logic."""
+    """Implements the expanded, targeted filtering logic."""
     
-    # 1. Check Modality (e.g., Ultrasound is high-risk)
-    if ds.get('Modality', '').upper() == 'US':
-        print("  - Running OCR: Modality is Ultrasound (US).")
+    modality = ds.get('Modality', '').upper()
+    study_desc = ds.get('StudyDescription', '').upper()
+    series_desc = ds.get('SeriesDescription', '').upper()
+    
+    # 1. Check Modality (US, XA, CR, DX are highest risk)
+    if modality in ['US', 'XA', 'CR', 'DX']: 
         return True
         
     # 2. Check for Secondary Capture Flag
     if ds.get('SOPClassUID') == SECONDARY_CAPTURE_UID:
-        print("  - Running OCR: Image is a Secondary Capture.")
         return True
         
-    # 3. Check for Burned-In Annotation Flag
-    if ds.get('BurnedInAnnotation', '').upper() == 'YES':
-        print("  - Running OCR: Burned-In Annotation flag is YES.")
+    # 3. Check for 'PORTABLE' or 'SC' in description 
+    if 'PORTABLE' in study_desc or 'PORTABLE' in series_desc or \
+       'SCANNED' in study_desc or 'SCANNED' in series_desc:
         return True
 
-    return True
+    # 4. Check for Burned-In Annotation Flag (if present)
+    if ds.get('BurnedInAnnotation', '').upper() == 'YES':
+        return True
+
+    return False
 
 def process_dicom_files(input_dir: str, output_dir: str):
     """Iterates through files and applies de-identification."""
     
-    # Setup directories
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
@@ -108,6 +143,7 @@ def process_dicom_files(input_dir: str, output_dir: str):
         
         # 2. Targeted OCR Filter Check
         if hasattr(ds, 'PixelData') and should_run_ocr(ds):
+            print(f"  - Running OCR: High-risk file (Modality: {ds.get('Modality', 'N/A')}).")
             ocr_run_count += 1
             # 3. Identify and Mask PHI Text
             run_ocr_and_mask(ds, original_phis, output_path)
@@ -121,10 +157,8 @@ def process_dicom_files(input_dir: str, output_dir: str):
     print(f"OCR Engine Run Count: {ocr_run_count} ({ocr_run_count/total_files*100:.2f}%)")
 
 if __name__ == '__main__':
-    # Create a dummy input folder for testing
     if not os.path.exists(INPUT_DIR):
-        os.makedirs(INPUT_DIR)
-        print(f"Created dummy input directory: {INPUT_DIR}")
-        print("Please place your test DICOM files (.dcm) inside this folder.")
+        print(f"Input directory not found: {INPUT_DIR}")
+        print("Please ensure the input directory is correctly set and exists.")
     else:
         process_dicom_files(INPUT_DIR, OUTPUT_DIR)
