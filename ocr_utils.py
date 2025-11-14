@@ -30,8 +30,50 @@ import pydicom
 OCR_CONF_THRESHOLD = 40       # keep words with conf >= this (tune per your OCR)
 LOCAL_PADDING_PIXELS = 3      # tiny padding around detected text strokes (not box)
 MIN_COMPONENT_AREA = 8        # minimum connected component area (pixels) to keep in local mask
-KEYWORDS = ['ID', 'NAME', 'DOB', 'DATE', 'TIME', 'ACCESSION', 'AGE', 'HOSPITAL',
-            'PATIENT', 'PHYSICIAN', 'INSTITUTION', 'PORTABLE', 'MRN']
+KEYWORDS = [
+    "PATIENT", "PATIENTID", "PATIENT ID",
+    "ID", "MRN", "MEDICAL RECORD",
+    "NAME", "PATIENT NAME", "INSTITUTION", "HOSPITAL",
+    "FACILITY", "CENTER", "CLINIC",
+    "PHYSICIAN", "DOCTOR", "REFERRING", "PERFORMING", "OPERATOR",
+    "STUDY", "STUDY DATE", "EXAM", "ACQUISITION",
+    "DATE", "TIME", "AGE", "DOB",
+    
+    # Newly Added Specific DICOM Tags/Fields
+    "PatientName",
+    "PatientID",
+    "PatientBirthDate",
+    "PatientBirthTime",
+    "PatientSex",
+    "PatientAge",
+    "OtherPatientIDs",
+    "OtherPatientNames",
+    "PatientAddress",
+    "PatientTelephoneNumbers",
+    "InstitutionName",
+    "InstitutionAddress",
+    "ReferringPhysicianName",
+    "ReferringPhysicianTelephoneNumbers",
+    "RequestingPhysician",
+    "InstitutionalDepartmentName",
+    "PhysiciansOfRecord",
+    "PerformingPhysicianName",
+    "NameOfPhysiciansReadingStudy",
+    "OperatorsName",
+    "StudyDate",
+    "StudyTime",
+    "AccessionNumber",
+    "StudyInstanceUID",
+    "SeriesInstanceUID",
+    "DeviceSerialNumber",
+    "DeviceSeriesNumber",
+    "StationName",
+    "StudyID",
+    "SeriesNumber",
+    "ScheduledPerformingPhysicianName",
+    "VerifyingObserverName",
+    "VerifyingObserverIdentificationCodeSequence",
+]
 
 
 # ---------- utilities ----------
