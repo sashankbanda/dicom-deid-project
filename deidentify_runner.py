@@ -11,49 +11,27 @@ OUTPUT_DIR = r"D:\0000 study spacd\06.1 SEM8\00 internship\01 go zeal\02 project
 # DICOM Tags from your COMPLETE list, labeled for clarity (Hexadecimal Tag, Keyword)
 PHI_TAGS = [
     # Patient Identifying Information
-    (0x0010, 0x0010), # PatientName
-    (0x0010, 0x0020), # PatientID
-    (0x0010, 0x0030), # PatientBirthDate
-    (0x0010, 0x0032), # PatientBirthTime
-    (0x0010, 0x0040), # PatientSex
-    (0x0010, 0x1010), # PatientAge
-    (0x0010, 0x1000), # OtherPatientIDs
-    (0x0010, 0x1001), # OtherPatientNames
-    (0x0010, 0x1040), # PatientAddress
-    (0x0010, 0x2150), # PatientTelephoneNumbers
+    (0x0010, 0x0010), (0x0010, 0x0020), (0x0010, 0x0030), (0x0010, 0x0032), 
+    (0x0010, 0x0040), (0x0010, 0x1010), (0x0010, 0x1000), (0x0010, 0x1001), 
+    (0x0010, 0x1040), (0x0010, 0x2150), 
     
     # Institution and Location Information
-    (0x0008, 0x0080), # InstitutionName
-    (0x0008, 0x0081), # InstitutionAddress
-    (0x0008, 0x1040), # InstitutionalDepartmentName
-    (0x0008, 0x1010), # StationName
+    (0x0008, 0x0080), (0x0008, 0x0081), (0x0008, 0x1040), (0x0008, 0x1010), 
     
     # Physician and Operator Names
-    (0x0008, 0x0090), # ReferringPhysicianName
-    (0x0008, 0x0094), # ReferringPhysicianTelephoneNumbers
-    (0x0008, 0x0096), # RequestingPhysician
-    (0x0008, 0x9000), # PhysiciansOfRecord
-    (0x0008, 0x1050), # PerformingPhysicianName
-    (0x0008, 0x1084), # NameOfPhysiciansReadingStudy
-    (0x0008, 0x1070), # OperatorsName
-    (0x0040, 0x0006), # ScheduledPerformingPhysicianName
-    (0x0040, 0xA075), # VerifyingObserverName
-    (0x0040, 0xA078), # VerifyingObserverIdentificationCodeSequence
+    (0x0008, 0x0090), (0x0008, 0x0094), (0x0008, 0x0096), (0x0008, 0x9000), 
+    (0x0008, 0x1050), (0x0008, 0x1084), (0x0008, 0x1070), 
+    (0x0040, 0x0006), (0x0040, 0xA075), (0x0040, 0xA078),
     
     # Dates, Times, and Study Identifiers
-    (0x0008, 0x0020), # StudyDate
-    (0x0008, 0x0030), # StudyTime
-    (0x0008, 0x0050), # AccessionNumber
-    (0x0020, 0x0010), # StudyID
-    (0x0020, 0x0011), # SeriesNumber
+    (0x0008, 0x0020), (0x0008, 0x0030), (0x0008, 0x0050), (0x0020, 0x0010), 
+    (0x0020, 0x0011),
     
     # Device Identifiers
-    (0x0018, 0x1000), # DeviceSerialNumber
-    (0x0018, 0x1002), # DeviceSeriesNumber
+    (0x0018, 0x1000), (0x0018, 0x1002),
     
     # Unique Identifiers (UIDs - MUST be replaced, not deleted)
-    (0x0020, 0x000D), # StudyInstanceUID
-    (0x0020, 0x000E)  # SeriesInstanceUID
+    (0x0020, 0x000D), (0x0020, 0x000E) 
 ]
 
 # DICOM SOP Class UID for Secondary Capture (High-risk images)
@@ -67,20 +45,16 @@ def remove_metadata_phi(ds: pydicom.Dataset) -> dict:
     
     for tag in PHI_TAGS:
         if tag in ds:
-            # Get the tag keyword and value before modification
             tag_name = ds[tag].keyword
             original_phis[tag_name] = str(ds[tag].value) 
             
-            # Rule: Replace UIDs/Numbers/IDs with new unique values or '0'
             if 'UID' in tag_name:
                  ds[tag].value = pydicom.uid.generate_uid()
             elif 'Number' in tag_name or 'ID' in tag_name:
-                 ds[tag].value = '0' # Placeholder value
-            # Rule: Delete other PHI tags (Names, Dates, Addresses, etc.)
+                 ds[tag].value = '0' 
             else:
                  del ds[tag]
                  
-    # Final safety check: ensure critical UIDs are new
     if 'StudyInstanceUID' in ds:
         ds.StudyInstanceUID = pydicom.uid.generate_uid()
     if 'SeriesInstanceUID' in ds:
