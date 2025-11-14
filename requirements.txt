@@ -1,0 +1,12 @@
+# pip install -r requirements.txt
+
+## DICOM and Image Handling
+pydicom
+numpy
+Pillow
+
+## Optical Character Recognition (OCR)
+pytesseract
+
+## Image Pre-processing for better OCR
+scikit-image

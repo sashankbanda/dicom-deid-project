@@ -1,0 +1,11 @@
+# Ignore auto-generated python files
+__pycache__/
+*.pyc
+
+# Ignore contents of these folders
+input_dcm/**
+output_dcm/**
+
+# But keep the folders themselves
+!input_dcm/
+!output_dcm/
